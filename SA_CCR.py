@@ -5,7 +5,12 @@ from scipy.stats import norm
 import cmath
 
 def RC(deals):
-    dealsMTM = deals.groupby(['counterparty', 'csa', 'TH', 'MTA']).agg({'mtm': 'sum', 'collateral': 'sum', 'NICA': 'sum'}).reset_index()
+    dealsMTM = deals.groupby(['counterparty', 'csa', 'TH', 'MTA']).apply(
+        lambda x: pd.Series({
+            'mtm': (x['mtm'] * x['rate']).sum(),
+            'collateral': (x['collateral'] * x['rate']).sum(),
+            'NICA': x['NICA'].sum()
+        })).reset_index()
 
     dealsMTM['RC'] = np.where((dealsMTM['csa'] == 0), np.maximum(dealsMTM['mtm'] - dealsMTM['collateral'], 0),
                   np.where((dealsMTM['csa'] == 1), np.maximum(dealsMTM['mtm'] - dealsMTM['collateral'], np.maximum(dealsMTM['TH'] + dealsMTM['MTA'] - dealsMTM['NICA'], 0)), np.nan))
@@ -22,7 +27,7 @@ def sduration_calc(deals):
     return deals
 
 def adj_notional_calc(deals):
-    deals['adj_notional'] = (deals['sduration'] * deals['notional_1']/1000)
+    deals['adj_notional'] = deals['sduration'] * deals['notional_1']/1000 * deals['rate']
     return deals
 
 def sdelta_calc(deals):
@@ -65,7 +70,7 @@ def maturity_bucket(deals):
 
 def hedging_sets_calc(deals):
     #grouping instruments into maturity buckets for each counterparty
-    df = deals.groupby(['counterparty', 'product', 'ccy_1', 'mat_bucket', 'Supervisory_factor', 'RC']).apply(
+    df = deals.groupby(['counterparty', 'product', 'ccy_1', 'rate', 'mat_bucket', 'Supervisory_factor', 'RC']).apply(
         lambda x:
         pd.Series({
             'D': (x['sdelta'] * x['adj_notional'] * x['maturity_factor']).sum(),
@@ -75,7 +80,7 @@ def hedging_sets_calc(deals):
 
     unique_hs = df['hedging_set'].unique()
 
-    data = pd.DataFrame(columns=['counterparty', 'product', 'Supervisory_factor', 'hedging_set', 'uncoll_mtm', 'RC', 'effective_notional'])
+    data = pd.DataFrame(columns=['counterparty', 'product', 'rate', 'Supervisory_factor', 'hedging_set', 'uncoll_mtm', 'RC', 'effective_notional'])
     #to calculate effective notional in every time bucket for each hedging set separately
     for hs_value in unique_hs:
         df2 = df[df['hedging_set'] == hs_value].copy()
@@ -85,12 +90,12 @@ def hedging_sets_calc(deals):
         df2['D2'] = df2.loc[df2['mat_bucket'] == 2, 'D']
         df2['D3'] = df2.loc[df2['mat_bucket'] == 3, 'D']
 
-        df2 = df2.groupby(['counterparty', 'product', 'Supervisory_factor', 'hedging_set', 'RC']).agg({'D1': 'sum', 'D2': 'sum', 'D3': 'sum', 'uncoll_mtm': 'sum'}).reset_index()
+        df2 = df2.groupby(['counterparty', 'product', 'rate', 'Supervisory_factor', 'hedging_set', 'RC']).agg({'D1': 'sum', 'D2': 'sum', 'D3': 'sum', 'uncoll_mtm': 'sum'}).reset_index()
         #to find effective total notional for each hedging set
         df2['effective_notional'] = (df2['D1']**2 + df2['D2']**2 + df2['D3']**2 + 1.4 * df2['D1'] * df2['D2'] + 1.4 * df2['D2'] * df2['D3'] + 0.6 * df2['D1'] * df2['D3'])**(1/2)
 
         data = pd.concat([data, df2])
-    data = data.groupby(['counterparty', 'RC']).apply(lambda x:
+    data = data.groupby(['counterparty', 'rate', 'RC']).apply(lambda x:
                                                                   pd.Series({
                                                                       'PFE': (x['Supervisory_factor'] * x[
                                                                           'effective_notional']).sum(),
@@ -110,8 +115,7 @@ def multiplier(deals_grouped, dealsCDS):
 
 def EAD(deals_grouped):
     deals_grouped.loc[deals_grouped['uncoll_mtm'] < 0, 'uncoll_mtm'] = 0
-    deals_grouped['EAD'] = 1.4 * (deals_grouped['RC'] + deals_grouped['multiplier'] * deals_grouped['PFE'])
-    #deals_grouped = deals_grouped.drop(['uncoll_mtm', 'multiplier'], axis=1)
+    deals_grouped['EAD'] = (1.4 * (deals_grouped['RC'] + deals_grouped['multiplier'] * deals_grouped['PFE']))
     return deals_grouped
 
 def credit_koef_calc(deals):
@@ -147,17 +151,20 @@ def divide(deals):
                                             'CMD_ Agricultural', 'CMD_ Other',]))].copy()
     return deals, dealsCDS
 
-deals = pd.read_excel('/Users/mihailzaytsev/Desktop/practical-python/Risk/dealsEx1_5.xlsx', engine='openpyxl')
+deals = pd.read_excel('/Users/mihailzaytsev/Desktop/CCR/SA_CCR/deals/SA6.xlsx', engine='openpyxl')
 supervisory_parameters = pd.read_excel('/Users/mihailzaytsev/Desktop/practical-python/Risk/Supervisory_parametres.xlsx', engine='openpyxl')
 deals = deals.merge(supervisory_parameters[['Asset', 'Class', 'Supervisory_factor', 'Correlation', 'Supervisory_option_volatility']],
                     how='left', left_on='product', right_on='Asset').drop('Asset', axis=1)
+
+deals[['year_frac_s', 'year_frac_e', 'year_frac_m']] = deals[['year_frac_s', 'year_frac_e',	'year_frac_m']].astype(float)
 
 deals = RC(deals)
 deals = sduration_calc(deals)
 deals = adj_notional_calc(deals)
 deals = sdelta_calc(deals)
 deals, dealsCDS = divide(deals)
-dealsCDS = credit_koef_calc(dealsCDS)
+if not dealsCDS.empty:
+    dealsCDS = credit_koef_calc(dealsCDS)
 deals = maturity_factor_calc(deals)
 deals = maturity_bucket(deals)
 deals = hedging_sets_calc(deals)
